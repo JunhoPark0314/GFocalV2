@@ -22,7 +22,7 @@ model = dict(
         add_extra_convs='on_output',
         num_outs=5),
     bbox_head=dict(
-        type='GFocalHead',
+        type='GFocalHeadReverse',
         num_classes=80,
         in_channels=256,
         stacked_convs=4,
@@ -31,7 +31,7 @@ model = dict(
             type='AnchorGenerator',
             ratios=[1.0],
             octave_base_scale=8,
-            scales_per_octave=1,
+            scales_per_octave=1, 
             strides=[8, 16, 32, 64, 128]),
         loss_cls=dict(
             type='QualityFocalLoss',
@@ -107,6 +107,7 @@ test_pipeline = [
             dict(type='Collect', keys=['img']),
         ])
 ]
+
 data = dict(
     samples_per_gpu=8,
     workers_per_gpu=8,

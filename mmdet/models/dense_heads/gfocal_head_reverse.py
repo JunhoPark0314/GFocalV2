@@ -49,7 +49,7 @@ class Integral(nn.Module):
 
 
 @HEADS.register_module()
-class GFocalHead(AnchorHead):
+class GFocalHeadReverse(AnchorHead):
     """Generalized Focal Loss V2: Learning Reliable Localization Quality
     Estimation for Dense Object Detection.
 
@@ -103,7 +103,7 @@ class GFocalHead(AnchorHead):
             self.total_dim += 1
         print('total dim = ', self.total_dim * 4)
 
-        super(GFocalHead, self).__init__(num_classes, in_channels, **kwargs)
+        super(GFocalHeadReverse, self).__init__(num_classes, in_channels, **kwargs)
 
         self.sampling = False
         if self.train_cfg:
@@ -148,11 +148,13 @@ class GFocalHead(AnchorHead):
         self.scales = nn.ModuleList(
             [Scale(1.0) for _ in self.anchor_generator.strides])
 
+        """
         conf_vector = [nn.Conv2d(4 * self.total_dim, self.reg_channels, 1)]
         conf_vector += [self.relu]
         conf_vector += [nn.Conv2d(self.reg_channels, 1, 1), nn.Sigmoid()]
 
         self.reg_conf = nn.Sequential(*conf_vector)
+        """
 
     def init_weights(self):
         """Initialize weights of the head."""
@@ -160,9 +162,11 @@ class GFocalHead(AnchorHead):
             normal_init(m.conv, std=0.01)
         for m in self.reg_convs:
             normal_init(m.conv, std=0.01)
+        """
         for m in self.reg_conf:
             if isinstance(m, nn.Conv2d):
                 normal_init(m, std=0.01)
+        """
         bias_cls = bias_init_with_prob(0.01)
         normal_init(self.gfl_cls, std=0.01, bias=bias_cls)
         normal_init(self.gfl_reg, std=0.01)
@@ -209,6 +213,7 @@ class GFocalHead(AnchorHead):
             reg_feat = reg_conv(reg_feat)
 
         bbox_pred = scale(self.gfl_reg(reg_feat)).float()
+        """
         N, C, H, W = bbox_pred.size()
         prob = F.softmax(bbox_pred.reshape(N, 4, self.reg_max+1, H, W), dim=2)
         prob_topk, _ = prob.topk(self.reg_topk, dim=2)
@@ -220,7 +225,8 @@ class GFocalHead(AnchorHead):
             stat = prob_topk
 
         quality_score = self.reg_conf(stat.reshape(N, -1, H, W))
-        cls_score = self.gfl_cls(cls_feat).sigmoid() * quality_score
+        """
+        cls_score = self.gfl_cls(cls_feat).sigmoid()# * quality_score
 
         return cls_score, bbox_pred
 
