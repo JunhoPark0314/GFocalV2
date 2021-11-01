@@ -142,9 +142,26 @@ class GFocalHeadReverse(AnchorHead):
                     norm_cfg=self.norm_cfg))
         assert self.num_anchors == 1, 'anchor free version'
         self.gfl_cls = nn.Conv2d(
-            self.feat_channels, self.cls_out_channels, 3, padding=1)
-        self.gfl_reg = nn.Conv2d(
-            self.feat_channels, 4 * (self.reg_max + 1), 3, padding=1)
+            self.feat_channels, self.cls_out_channels, 1)
+        self.gfl_reg = nn.ModuleDict({
+            "0": nn.Conv2d(self.feat_channels, 4 * (self.reg_max + 1), 1),
+            "1": nn.Conv2d(self.feat_channels, 4 * (self.reg_max + 1), 1),
+            "2": nn.Conv2d(self.feat_channels, 4 * (self.reg_max + 1), 1),
+        })
+
+        self.len_buffer = 2 ** 14
+        self.momentum = 0.999
+        
+        self.cycle_buffer = False
+        self.register_buffer("ema_gfl_mean_mu", torch.zeros(3))
+        self.register_buffer("ema_gfl_max_mu", torch.zeros(3))
+        self.register_buffer("ema_gfl_max_var", torch.ones(3))
+        self.register_buffer("margin", torch.tensor([0.2, 0.3, 0.4]))
+
+        self.gfl_max_list_cursor = 0
+        self.register_buffer("ema_gfl_max_list", torch.zeros(3, self.len_buffer))
+        self.register_buffer("ema_gfl_mean_list", torch.zeros(3, self.len_buffer))
+
         self.scales = nn.ModuleList(
             [Scale(1.0) for _ in self.anchor_generator.strides])
 
@@ -169,7 +186,8 @@ class GFocalHeadReverse(AnchorHead):
         """
         bias_cls = bias_init_with_prob(0.01)
         normal_init(self.gfl_cls, std=0.01, bias=bias_cls)
-        normal_init(self.gfl_reg, std=0.01)
+        for k, v in self.gfl_reg.items():
+            normal_init(v, std=0.01)
 
     def forward(self, feats):
         """Forward features from the upstream network.
@@ -212,7 +230,7 @@ class GFocalHeadReverse(AnchorHead):
         for reg_conv in self.reg_convs:
             reg_feat = reg_conv(reg_feat)
 
-        bbox_pred = scale(self.gfl_reg(reg_feat)).float()
+        bbox_pred = {k : scale(self.gfl_reg[k](reg_feat)).float() for k in self.gfl_reg.keys()}
         """
         N, C, H, W = bbox_pred.size()
         prob = F.softmax(bbox_pred.reshape(N, 4, self.reg_max+1, H, W), dim=2)
@@ -243,6 +261,26 @@ class GFocalHeadReverse(AnchorHead):
         anchors_cy = (anchors[:, 3] + anchors[:, 1]) / 2
         return torch.stack([anchors_cx, anchors_cy], dim=-1)
 
+    def update_buffer_list(self, max_score, mean_score):
+        cur_len = mean_score.shape[-1]
+        if self.gfl_max_list_cursor + cur_len > self.len_buffer:
+            self.cycle_buffer = True
+            push_len = self.len_buffer - self.gfl_max_list_cursor
+            self.ema_gfl_max_list[...,self.gfl_max_list_cursor:] = max_score[...,:push_len]
+            self.ema_gfl_mean_list[...,self.gfl_max_list_cursor:] = mean_score[...,:push_len]
+            self.gfl_max_list_cursor = 0
+            cur_len -= push_len
+            self.ema_gfl_max_list[...,self.gfl_max_list_cursor:self.gfl_max_list_cursor + cur_len] = max_score[...,push_len:]
+            self.ema_gfl_mean_list[...,self.gfl_max_list_cursor:self.gfl_max_list_cursor + cur_len] = mean_score[...,push_len:]
+        else:
+            self.ema_gfl_max_list[:,self.gfl_max_list_cursor:self.gfl_max_list_cursor + cur_len] = max_score
+            self.ema_gfl_mean_list[:,self.gfl_max_list_cursor:self.gfl_max_list_cursor + cur_len] = mean_score
+        self.gfl_max_list_cursor += cur_len
+
+        last_len = self.len_buffer if self.cycle_buffer else self.gfl_max_list_cursor
+        self.ema_gfl_mean_mu = self.momentum * self.ema_gfl_mean_mu + (1 - self.momentum) * (self.ema_gfl_mean_list[:,:last_len].mean(dim=-1))
+        self.ema_gfl_max_mu = self.momentum * self.ema_gfl_max_mu + (1 - self.momentum) * (self.ema_gfl_max_list[:,:last_len].mean(dim=-1))
+
     def loss_single(self, anchors, cls_score, bbox_pred, labels, label_weights,
                     bbox_targets, stride, num_total_samples):
         """Compute loss of a single scale level.
@@ -272,8 +310,8 @@ class GFocalHeadReverse(AnchorHead):
         anchors = anchors.reshape(-1, 4)
         cls_score = cls_score.permute(0, 2, 3,
                                       1).reshape(-1, self.cls_out_channels)
-        bbox_pred = bbox_pred.permute(0, 2, 3,
-                                      1).reshape(-1, 4 * (self.reg_max + 1))
+        bbox_pred = {k : v.permute(0, 2, 3,
+                                      1).reshape(-1, 4 * (self.reg_max + 1)) for k, v in bbox_pred.items()}
         bbox_targets = bbox_targets.reshape(-1, 4)
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
@@ -282,45 +320,63 @@ class GFocalHeadReverse(AnchorHead):
         bg_class_ind = self.num_classes
         pos_inds = ((labels >= 0)
                     & (labels < bg_class_ind)).nonzero().squeeze(1)
-        score = label_weights.new_zeros(labels.shape)
+        score = {k : label_weights.new_zeros(labels.shape) for k, v in self.gfl_reg.items()}
 
         if len(pos_inds) > 0:
             pos_bbox_targets = bbox_targets[pos_inds]
-            pos_bbox_pred = bbox_pred[pos_inds]
+            pos_bbox_pred = {k: v[pos_inds] for k, v in bbox_pred.items()}
             pos_anchors = anchors[pos_inds]
             pos_anchor_centers = self.anchor_center(pos_anchors) / stride[0]
 
             weight_targets = cls_score.detach()
             weight_targets = weight_targets.max(dim=1)[0][pos_inds]
-            pos_bbox_pred_corners = self.integral(pos_bbox_pred)
-            pos_decode_bbox_pred = distance2bbox(pos_anchor_centers,
-                                                 pos_bbox_pred_corners)
+            pos_bbox_pred_corners = {k: self.integral(v) for k,v in pos_bbox_pred.items()}
+
+            pos_bbox_max_reg = torch.cat([ v.view(-1, self.reg_max+1).softmax(dim=-1).max(dim=-1)[0].unsqueeze(0).detach()
+                                    for k, v in pos_bbox_pred.items()])
+            pos_bbox_mean_reg = torch.cat([ v.view(-1, self.reg_max+1).softmax(dim=-1).mean(dim=-1).unsqueeze(0).detach()
+                                    for k, v in pos_bbox_pred.items()])
+
+            self.update_buffer_list(pos_bbox_max_reg, pos_bbox_mean_reg)
+
+            max_mean_discrepancy = pos_bbox_max_reg - pos_bbox_mean_reg
+            ema_discrepancy = self.ema_gfl_max_mu - self.ema_gfl_mean_mu
+            box_weight = ((max_mean_discrepancy - (ema_discrepancy + self.margin).unsqueeze(-1))).softmax(dim=0).view(3, 4, -1)
+            pos_decode_bbox_pred = {k: distance2bbox(pos_anchor_centers,v)
+                                        for k,v in pos_bbox_pred_corners.items()}
             pos_decode_bbox_targets = pos_bbox_targets / stride[0]
-            score[pos_inds] = bbox_overlaps(
-                pos_decode_bbox_pred.detach(),
-                pos_decode_bbox_targets,
-                is_aligned=True)
-            pred_corners = pos_bbox_pred.reshape(-1, self.reg_max + 1)
+
+            for k, v in pos_decode_bbox_pred.items():
+                score[k][pos_inds] = bbox_overlaps(
+                    v.detach(),
+                    pos_decode_bbox_targets,
+                    is_aligned=True)
+            score = torch.stack(list(score.values()))
+            score[:,pos_inds] *= box_weight.mean(dim=1)
+            score = score.sum(dim=0) * 1.5
+
+            pred_corners = {k: v.reshape(-1, self.reg_max + 1) for k, v in pos_bbox_pred.items()}
             target_corners = bbox2distance(pos_anchor_centers,
                                            pos_decode_bbox_targets,
                                            self.reg_max).reshape(-1)
 
             # regression loss
-            loss_bbox = self.loss_bbox(
-                pos_decode_bbox_pred,
+            loss_bbox = sum([self.loss_bbox(
+                v,
                 pos_decode_bbox_targets,
                 weight=weight_targets,
-                avg_factor=1.0)
+                avg_factor=1.0) for k, v in pos_decode_bbox_pred.items()]) / 3
 
             # dfl loss
-            loss_dfl = self.loss_dfl(
-                pred_corners,
+            loss_dfl = sum([self.loss_dfl(
+                v,
                 target_corners,
-                weight=weight_targets[:, None].expand(-1, 4).reshape(-1),
-                avg_factor=4.0)
+                weight=(weight_targets[:, None].expand(-1, 4) * box_weight[int(k)].T).reshape(-1) * 2,
+                avg_factor=4.0) for k, v in pred_corners.items()]) / 3
         else:
-            loss_bbox = bbox_pred.sum() * 0
-            loss_dfl = bbox_pred.sum() * 0
+            loss_bbox = sum([v.sum() * 0 for k, v in bbox_pred.items()])
+            loss_dfl = sum([v.sum() * 0 for k, v in bbox_pred.items()])
+            score = torch.stack(list(score.values())).mean(dim=0)
             weight_targets = torch.tensor(0).cuda()
 
         # cls (qfl) loss
@@ -403,6 +459,107 @@ class GFocalHeadReverse(AnchorHead):
         losses_dfl = list(map(lambda x: x / avg_factor, losses_dfl))
         return dict(
             loss_cls=losses_cls, loss_bbox=losses_bbox, loss_dfl=losses_dfl)
+
+    
+    @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
+    def get_bboxes(self,
+                   cls_scores,
+                   bbox_preds,
+                   img_metas,
+                   cfg=None,
+                   rescale=False,
+                   with_nms=True):
+        """Transform network output for a batch into bbox predictions.
+
+        Args:
+            cls_scores (list[Tensor]): Box scores for each scale level
+                Has shape (N, num_anchors * num_classes, H, W)
+            bbox_preds (list[Tensor]): Box energies / deltas for each scale
+                level with shape (N, num_anchors * 4, H, W)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            cfg (mmcv.Config | None): Test / postprocessing configuration,
+                if None, test_cfg would be used
+            rescale (bool): If True, return boxes in original image space.
+                Default: False.
+            with_nms (bool): If True, do nms before return boxes.
+                Default: True.
+
+        Returns:
+            list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
+                The first item is an (n, 5) tensor, where the first 4 columns
+                are bounding box positions (tl_x, tl_y, br_x, br_y) and the
+                5-th column is a score between 0 and 1. The second item is a
+                (n,) tensor where each item is the predicted class labelof the
+                corresponding box.
+
+        Example:
+            >>> import mmcv
+            >>> self = AnchorHead(
+            >>>     num_classes=9,
+            >>>     in_channels=1,
+            >>>     anchor_generator=dict(
+            >>>         type='AnchorGenerator',
+            >>>         scales=[8],
+            >>>         ratios=[0.5, 1.0, 2.0],
+            >>>         strides=[4,]))
+            >>> img_metas = [{'img_shape': (32, 32, 3), 'scale_factor': 1}]
+            >>> cfg = mmcv.Config(dict(
+            >>>     score_thr=0.00,
+            >>>     nms=dict(type='nms', iou_thr=1.0),
+            >>>     max_per_img=10))
+            >>> feat = torch.rand(1, 1, 3, 3)
+            >>> cls_score, bbox_pred = self.forward_single(feat)
+            >>> # note the input lists are over different levels, not images
+            >>> cls_scores, bbox_preds = [cls_score], [bbox_pred]
+            >>> result_list = self.get_bboxes(cls_scores, bbox_preds,
+            >>>                               img_metas, cfg)
+            >>> det_bboxes, det_labels = result_list[0]
+            >>> assert len(result_list) == 1
+            >>> assert det_bboxes.shape[1] == 5
+            >>> assert len(det_bboxes) == len(det_labels) == cfg.max_per_img
+        """
+        assert len(cls_scores) == len(bbox_preds)
+        num_levels = len(cls_scores)
+
+        device = cls_scores[0].device
+        featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
+        mlvl_anchors = self.anchor_generator.grid_anchors(
+            featmap_sizes, device=device)
+
+        result_list = []
+        for img_id in range(len(img_metas)):
+            cls_score_list = [
+                cls_scores[i][img_id].detach() for i in range(num_levels)
+            ]
+
+            bbox_idx_per_img = []
+            for per_img_bbox in bbox_preds:
+                bbox_idx = []
+                for k in self.gfl_reg:
+                    bbox_idx.append(bbox_preds[0][k].softmax(dim=1).max(dim=1)[0] - bbox_preds[0][k].softmax(dim=1).mean(dim=1))
+                bbox_idx = torch.cat(bbox_idx)
+
+            bbox_pred_list = [
+                bbox_preds[i]['0'][img_id].detach() for i in range(num_levels)
+            ]
+            
+            img_shape = img_metas[img_id]['img_shape']
+            scale_factor = img_metas[img_id]['scale_factor']
+            if with_nms:
+                # some heads don't support with_nms argument
+                proposals = self._get_bboxes_single(cls_score_list,
+                                                    bbox_pred_list,
+                                                    mlvl_anchors, img_shape,
+                                                    scale_factor, cfg, rescale)
+            else:
+                proposals = self._get_bboxes_single(cls_score_list,
+                                                    bbox_pred_list,
+                                                    mlvl_anchors, img_shape,
+                                                    scale_factor, cfg, rescale,
+                                                    with_nms)
+            result_list.append(proposals)
+        return result_list
 
     def _get_bboxes_single(self,
                            cls_scores,

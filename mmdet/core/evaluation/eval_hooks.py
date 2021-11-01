@@ -39,6 +39,7 @@ class EvalHook(Hook):
         self.start = start
         self.eval_kwargs = eval_kwargs
         self.initial_epoch_flag = True
+        #self.start = True
 
     def before_train_epoch(self, runner):
         """Evaluate the model only at the start of training."""
