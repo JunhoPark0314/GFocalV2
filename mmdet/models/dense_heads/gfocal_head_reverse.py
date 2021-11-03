@@ -156,7 +156,7 @@ class GFocalHeadReverse(AnchorHead):
         self.register_buffer("ema_gfl_mean_mu", torch.zeros(3))
         self.register_buffer("ema_gfl_max_mu", torch.zeros(3))
         self.register_buffer("ema_gfl_max_var", torch.ones(3))
-        self.register_buffer("margin", torch.tensor([0.2, 0.3, 0.4]))
+        self.register_buffer("margin", torch.tensor([0.2, 0.2, 0.2]))
 
         self.gfl_max_list_cursor = 0
         self.register_buffer("ema_gfl_max_list", torch.zeros(3, self.len_buffer))
@@ -341,9 +341,14 @@ class GFocalHeadReverse(AnchorHead):
 
             max_mean_discrepancy = pos_bbox_max_reg - pos_bbox_mean_reg
             ema_discrepancy = self.ema_gfl_max_mu - self.ema_gfl_mean_mu
-            box_weight = ((max_mean_discrepancy - (ema_discrepancy + self.margin).unsqueeze(-1))).softmax(dim=0).view(3, 4, -1)
+            box_weight = ((max_mean_discrepancy - (ema_discrepancy + self.margin).unsqueeze(-1) + max_mean_discrepancy.normal_().detach() * 0.1)).softmax(dim=0).view(3, 4, -1)
             pos_decode_bbox_pred = {k: distance2bbox(pos_anchor_centers,v)
                                         for k,v in pos_bbox_pred_corners.items()}
+
+            pos_decode_bbox_pred = {
+                k: Progressive.apply(v, box_weight[int(k)].T) for k,v in pos_decode_bbox_pred.items()
+            }
+
             pos_decode_bbox_targets = pos_bbox_targets / stride[0]
 
             for k, v in pos_decode_bbox_pred.items():
@@ -352,8 +357,8 @@ class GFocalHeadReverse(AnchorHead):
                     pos_decode_bbox_targets,
                     is_aligned=True)
             score = torch.stack(list(score.values()))
-            score[:,pos_inds] *= box_weight.mean(dim=1)
-            score = score.sum(dim=0) * 1.5
+            #score[:,pos_inds] *= box_weight.mean(dim=1)
+            score = score.mean(dim=0)
 
             pred_corners = {k: v.reshape(-1, self.reg_max + 1) for k, v in pos_bbox_pred.items()}
             target_corners = bbox2distance(pos_anchor_centers,
@@ -533,15 +538,19 @@ class GFocalHeadReverse(AnchorHead):
                 cls_scores[i][img_id].detach() for i in range(num_levels)
             ]
 
-            bbox_idx_per_img = []
+            bbox_preds_weighted = []
             for per_img_bbox in bbox_preds:
                 bbox_idx = []
+                per_img_preds = []
                 for k in self.gfl_reg:
-                    bbox_idx.append(bbox_preds[0][k].softmax(dim=1).max(dim=1)[0] - bbox_preds[0][k].softmax(dim=1).mean(dim=1))
+                    bbox_idx.append(per_img_bbox[k].softmax(dim=1).max(dim=1)[0] - per_img_bbox[k].softmax(dim=1).mean(dim=1))
+                    per_img_preds.append(per_img_bbox[k])
                 bbox_idx = torch.cat(bbox_idx)
-
+                per_img_preds = torch.cat(per_img_preds)
+                bbox_preds_weighted.append((F.one_hot(bbox_idx.max(dim=0)[1], num_classes=3).permute(2, 0, 1).unsqueeze(1) * per_img_preds).sum(dim=0).unsqueeze(0))
+                
             bbox_pred_list = [
-                bbox_preds[i]['0'][img_id].detach() for i in range(num_levels)
+                bbox_preds_weighted[i][img_id].detach() for i in range(num_levels)
             ]
             
             img_shape = img_metas[img_id]['img_shape']
@@ -823,3 +832,32 @@ class GFocalHeadReverse(AnchorHead):
             int(flags.sum()) for flags in split_inside_flags
         ]
         return num_level_anchors_inside
+
+class Progressive(torch.autograd.Function):
+    """
+    We can implement our own custom autograd Functions by subclassing
+    torch.autograd.Function and implementing the forward and backward passes
+    which operate on Tensors.
+    """
+
+    @staticmethod
+    def forward(ctx, input, scale_thr):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(input, scale_thr.clone())
+        return input
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+        input, scale_thr = ctx.saved_tensors
+        grad_input = grad_output.clone()
+        return grad_input * scale_thr, torch.zeros_like(scale_thr)
